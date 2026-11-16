@@ -1,99 +1,177 @@
+using System.Reflection;
 using Discord;
+using Discord.Interactions;
 using Discord.WebSocket;
 
 namespace MessageBot.Services;
 
-/// <summary>
-/// Manages the Discord connection for the lifetime of the application.
-/// The caller owns and disposes the Discord client.
-/// </summary>
-public sealed class BotService(DiscordSocketClient client)
+public sealed class InteractionHandler : IDisposable
 {
-    private readonly DiscordSocketClient _client =
-        client ?? throw new ArgumentNullException(nameof(client));
+    private readonly DiscordSocketClient _client;
+    private readonly InteractionService _interactions;
+    private readonly IServiceProvider _services;
+    private readonly ulong? _developmentGuildId;
 
-    private int _running;
+    private bool _initialized;
+    private bool _disposed;
 
-    public async Task RunAsync(
-        string token,
-        CancellationToken cancellationToken = default)
+    public InteractionHandler(
+        DiscordSocketClient client,
+        InteractionService interactions,
+        IServiceProvider services,
+        ulong? developmentGuildId = null)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(token);
+        ArgumentNullException.ThrowIfNull(client);
+        ArgumentNullException.ThrowIfNull(interactions);
+        ArgumentNullException.ThrowIfNull(services);
 
-        cancellationToken.ThrowIfCancellationRequested();
+        _client = client;
+        _interactions = interactions;
+        _services = services;
+        _developmentGuildId = developmentGuildId;
+    }
 
-        if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
+    public async Task InitializeAsync()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (_initialized)
         {
             throw new InvalidOperationException(
-                "The bot service is already running.");
+                "The interaction handler is already initialized.");
         }
 
-        var loggedIn = false;
-        var startAttempted = false;
+        await _interactions.AddModulesAsync(
+            Assembly.GetExecutingAssembly(),
+            _services);
 
-        try
-        {
-            await _client.LoginAsync(TokenType.Bot, token);
-            loggedIn = true;
+        _client.Ready += OnReadyAsync;
+        _client.InteractionCreated += OnInteractionCreatedAsync;
 
-            cancellationToken.ThrowIfCancellationRequested();
-
-            startAttempted = true;
-            await _client.StartAsync();
-
-            await Task.Delay(Timeout.Infinite, cancellationToken);
-        }
-        catch (OperationCanceledException)
-            when (cancellationToken.IsCancellationRequested)
-        {
-            // Cancellation is the normal shutdown path.
-        }
-        finally
-        {
-            try
-            {
-                if (startAttempted)
-                {
-                    await StopAsync();
-                }
-
-                if (loggedIn)
-                {
-                    await LogoutAsync();
-                }
-            }
-            finally
-            {
-                Volatile.Write(ref _running, 0);
-            }
-        }
+        _initialized = true;
     }
 
-    private async Task StopAsync()
+    private async Task OnReadyAsync()
     {
         try
         {
-            await _client.StopAsync();
+            if (_developmentGuildId is { } guildId)
+            {
+                await _interactions.RegisterCommandsToGuildAsync(
+                    guildId,
+                    deleteMissing: false);
+            }
+            else
+            {
+                await _interactions.RegisterCommandsGloballyAsync(
+                    deleteMissing: false);
+            }
+
+            Console.WriteLine("Application commands registered.");
         }
         catch (Exception exception)
         {
             Console.Error.WriteLine(
-                $"Failed to stop the Discord client: " +
-                $"{exception.GetType().Name}.");
+                $"Command registration failed: {exception.GetType().Name}.");
         }
     }
 
-    private async Task LogoutAsync()
+    private async Task OnInteractionCreatedAsync(
+        SocketInteraction interaction)
     {
+        if (interaction is not SocketSlashCommand
+            and not SocketModal)
+        {
+            return;
+        }
+
         try
         {
-            await _client.LogoutAsync();
+            var context = new SocketInteractionContext(
+                _client,
+                interaction);
+
+            var result = await _interactions.ExecuteCommandAsync(
+                context,
+                _services);
+
+            if (result.IsSuccess)
+            {
+                return;
+            }
+
+            Console.Error.WriteLine(
+                $"Interaction execution failed: {result.Error}.");
+
+            var message = result.Error switch
+            {
+                InteractionCommandError.UnmetPrecondition =>
+                    "You do not meet the requirements for this command.",
+
+                InteractionCommandError.UnknownCommand =>
+                    "This command is currently unavailable.",
+
+                InteractionCommandError.BadArgs =>
+                    "The command arguments are invalid.",
+
+                _ => "The command could not be completed."
+            };
+
+            await SendErrorAsync(interaction, message);
         }
         catch (Exception exception)
         {
             Console.Error.WriteLine(
-                $"Failed to log out of Discord: " +
+                $"Interaction handling failed: {exception.GetType().Name}.");
+
+            await SendErrorAsync(
+                interaction,
+                "An unexpected error occurred.");
+        }
+    }
+
+    private static async Task SendErrorAsync(
+        SocketInteraction interaction,
+        string message)
+    {
+        try
+        {
+            if (interaction.HasResponded)
+            {
+                await interaction.FollowupAsync(
+                    text: message,
+                    ephemeral: true,
+                    allowedMentions: AllowedMentions.None);
+            }
+            else
+            {
+                await interaction.RespondAsync(
+                    text: message,
+                    ephemeral: true,
+                    allowedMentions: AllowedMentions.None);
+            }
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine(
+                $"Failed to send interaction response: " +
                 $"{exception.GetType().Name}.");
         }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (_initialized)
+        {
+            _client.Ready -= OnReadyAsync;
+            _client.InteractionCreated -= OnInteractionCreatedAsync;
+        }
+
+        _disposed = true;
     }
 }
