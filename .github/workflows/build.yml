@@ -18,6 +18,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Inspect checked-out source
+        shell: bash
+        run: |
+          echo "Event: $GITHUB_EVENT_NAME"
+          echo "Ref: $GITHUB_REF"
+          git log -1 --format="%H %s"
+
+          echo "InteractionHandler.cs:"
+          nl -ba src/MessageBot/Services/InteractionHandler.cs | head -40
+
+          echo "Service declarations:"
+          git grep -n -E 'class (BotService|InteractionHandler)' -- '*.cs' || true
+
       - name: Set up .NET
         uses: actions/setup-dotnet@v4
         with:
